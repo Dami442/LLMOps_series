@@ -16,7 +16,7 @@ pipeline {
     
     environment {
         // AWS Configuration (set these as environment variables in Jenkins)
-        AWS_REGION = "${env.AWS_REGION ?: 'us-west-1'}"
+        AWS_REGION = "${env.AWS_REGION ?: 'eu-west-2'}"
         AWS_ACCESS_KEY_ID = "${env.AWS_ACCESS_KEY_ID}"
         AWS_SECRET_ACCESS_KEY = "${env.AWS_SECRET_ACCESS_KEY}"
         

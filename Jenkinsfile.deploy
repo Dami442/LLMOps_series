@@ -1,46 +1,53 @@
 /*
  * Jenkins Pipeline for MultiDocChat Application Deployment to AWS EKS
- * 
+ *
  * This pipeline builds, pushes, and deploys the MultiDocChat application:
  * - Builds Docker image
  * - Pushes to ECR
  * - Deploys to EKS with zero-downtime rolling updates
- * 
+ *
+ * LLM provider: OpenRouter (OpenAI-compatible). The OpenRouter key is stored in
+ * Jenkins as credential ID "OPENROUTER_API_KEY" and exposed to the app as
+ * OPENAI_API_KEY, with OPENAI_BASE_URL pointing at OpenRouter. No app code changes.
+ *
+ * Required Jenkins credentials (Secret text):
+ *   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, OPENROUTER_API_KEY
+ *
  * Trigger: Automatic (SCM polling every 5 minutes) or Manual
- * Duration: ~5-10 minutes
  */
 
 pipeline {
     agent any
-    
+
     environment {
         // AWS Configuration
-        AWS_REGION = "${env.AWS_REGION ?: 'us-east-1'}"
-        AWS_ACCESS_KEY_ID = "${env.AWS_ACCESS_KEY_ID}"
-        AWS_SECRET_ACCESS_KEY = "${env.AWS_SECRET_ACCESS_KEY}"
-        
+        AWS_REGION            = "${env.AWS_REGION ?: 'eu-west-2'}"
+        AWS_DEFAULT_REGION    = "${env.AWS_REGION ?: 'eu-west-2'}"
+        AWS_ACCESS_KEY_ID     = credentials('AWS_ACCESS_KEY_ID')
+        AWS_SECRET_ACCESS_KEY = credentials('AWS_SECRET_ACCESS_KEY')
+
         // EKS Configuration
         EKS_CLUSTER_NAME = "${env.EKS_CLUSTER_NAME ?: 'multi-doc-chat-live-cluster'}"
-        
-        // ECR Configuration
-        ECR_REGISTRY = "${env.ECR_REGISTRY}"  // Format: account-id.dkr.ecr.region.amazonaws.com
+
+        // ECR Configuration (format: account-id.dkr.ecr.region.amazonaws.com)
+        ECR_REGISTRY   = "${env.ECR_REGISTRY ?: '651103158328.dkr.ecr.eu-west-2.amazonaws.com'}"
         ECR_REPOSITORY = "${env.ECR_REPOSITORY ?: 'multi-doc-chat-live'}"
-        
-        // Application Secrets
-        GROQ_API_KEY = "${env.GROQ_API_KEY ?: ''}"
-        OPENAI_API_KEY = "${env.OPENAI_API_KEY ?: ''}"
-        GOOGLE_API_KEY = "${env.GOOGLE_API_KEY ?: ''}"
-        
+
+        // Application Secrets: OpenRouter via OpenAI-compatible variables
+        OPENAI_API_KEY  = credentials('OPENROUTER_API_KEY')
+        OPENAI_BASE_URL = 'https://openrouter.ai/api/v1'
+        OPENAI_API_BASE = 'https://openrouter.ai/api/v1'
+
         // Build Configuration
         BUILD_TIMESTAMP = sh(script: "date +%s", returnStdout: true).trim()
-        IMAGE_TAG = "${BUILD_TIMESTAMP}"
+        IMAGE_TAG       = "${BUILD_TIMESTAMP}"
     }
-    
+
     triggers {
         // Poll SCM every 5 minutes for changes
         pollSCM('H/5 * * * *')
     }
-    
+
     stages {
         stage('Checkout') {
             steps {
@@ -48,22 +55,20 @@ pipeline {
                 checkout scm
             }
         }
-        
+
         stage('Verify Prerequisites') {
             steps {
                 echo '🔍 Verifying prerequisites...'
                 script {
                     sh '''
                         set -e
-                        
-                        # Check if Docker is available and accessible
+
                         echo "Checking Docker..."
                         if ! command -v docker >/dev/null 2>&1; then
                             echo "❌ Docker is not installed"
                             exit 1
                         fi
-                        
-                        # Test Docker access
+
                         if ! docker ps >/dev/null 2>&1; then
                             echo "❌ Docker daemon is not accessible"
                             echo "Current user: $(whoami)"
@@ -71,42 +76,43 @@ pipeline {
                             ls -la /var/run/docker.sock || true
                             exit 1
                         fi
-                        
+
                         echo "✅ Docker is accessible"
                         docker version
-                        
-                        # Check AWS CLI
+
                         echo "Checking AWS CLI..."
                         if ! command -v aws >/dev/null 2>&1; then
                             echo "❌ AWS CLI is not installed"
                             exit 1
                         fi
                         echo "✅ AWS CLI version: $(aws --version)"
-                        
-                        # Check kubectl
+
                         echo "Checking kubectl..."
                         if ! command -v kubectl >/dev/null 2>&1; then
                             echo "❌ kubectl is not installed"
                             exit 1
                         fi
                         echo "✅ kubectl version: $(kubectl version --client --short 2>/dev/null || kubectl version --client)"
-                        
-                        # Check AWS credentials
+
                         if [ -z "${AWS_ACCESS_KEY_ID}" ] || [ -z "${AWS_SECRET_ACCESS_KEY}" ]; then
                             echo "❌ AWS credentials not set"
                             exit 1
                         fi
                         echo "✅ AWS credentials are set"
-                        
-                        # Check ECR registry
+
+                        if [ -z "${OPENAI_API_KEY}" ]; then
+                            echo "❌ OpenRouter API key not set (credential ID: OPENROUTER_API_KEY)"
+                            exit 1
+                        fi
+                        echo "✅ OpenRouter key is set (routing via ${OPENAI_BASE_URL})"
+
                         if [ -z "${ECR_REGISTRY}" ]; then
-                            echo "❌ ECR_REGISTRY environment variable not set"
+                            echo "❌ ECR_REGISTRY not set"
                             echo "Set it to: <account-id>.dkr.ecr.${AWS_REGION}.amazonaws.com"
                             exit 1
                         fi
                         echo "✅ ECR_REGISTRY is set: ${ECR_REGISTRY}"
-                        
-                        # Verify region consistency
+
                         echo ""
                         echo "Verifying region consistency..."
                         if echo "${ECR_REGISTRY}" | grep -q "${AWS_REGION}"; then
@@ -115,277 +121,241 @@ pipeline {
                             echo "⚠️  WARNING: ECR registry region may not match AWS_REGION"
                             echo "   ECR_REGISTRY: ${ECR_REGISTRY}"
                             echo "   AWS_REGION: ${AWS_REGION}"
-                            echo "   Please verify these are consistent"
                         fi
-                        
+
                         echo ""
                         echo "✅ All prerequisites check passed"
                     '''
                 }
             }
         }
-        
+
         stage('Verify EKS Cluster') {
             steps {
                 echo '🔍 Verifying EKS cluster exists...'
                 script {
                     sh '''
                         set -e
-                        
-                        # Check if EKS cluster exists
-                        CLUSTER_STATUS=$(aws eks describe-cluster \
+
+                        if ! CLUSTER_STATUS=$(aws eks describe-cluster \
                             --name ${EKS_CLUSTER_NAME} \
                             --region ${AWS_REGION} \
                             --query 'cluster.status' \
-                            --output text 2>&1)
-                        
-                        if [ $? -ne 0 ]; then
-                            echo "❌ EKS Cluster '${EKS_CLUSTER_NAME}' not found!"
+                            --output text 2>&1); then
+                            echo "❌ EKS Cluster '${EKS_CLUSTER_NAME}' not found or not accessible!"
+                            echo "${CLUSTER_STATUS}"
                             echo "Please run Jenkinsfile.infra first to provision infrastructure."
                             exit 1
                         fi
-                        
+
                         echo "Cluster Status: ${CLUSTER_STATUS}"
-                        
+
                         if [ "${CLUSTER_STATUS}" != "ACTIVE" ]; then
                             echo "❌ EKS Cluster is not ACTIVE"
                             exit 1
                         fi
-                        
+
                         echo "✅ EKS Cluster verified"
                     '''
                 }
             }
         }
-        
+
         stage('Login to ECR') {
             steps {
                 echo '🔐 Logging in to Amazon ECR...'
                 script {
                     sh '''
                         set -e
-                        
-                        # Get ECR login password and login to Docker
+
                         aws ecr get-login-password --region ${AWS_REGION} | \
                             docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                        
+
                         echo "✅ Successfully logged in to ECR"
                     '''
                 }
             }
         }
-        
+
         stage('Setup Docker Buildx') {
             steps {
-                echo '🔧 Setting up Docker Buildx for multi-platform builds...'
+                echo '🔧 Setting up Docker Buildx...'
                 script {
                     sh '''
                         set -e
-                        
-                        # Check if buildx is available
-                        if ! docker buildx version &>/dev/null; then
-                            echo "❌ Docker buildx not available"
-                            echo "Using standard docker build instead"
+
+                        if ! docker buildx version >/dev/null 2>&1; then
+                            echo "⚠️  Docker buildx not available, skipping setup"
                             exit 0
                         fi
-                        
+
                         echo "✅ Docker buildx is available"
-                        
-                        # Create or use existing buildx builder
-                        if ! docker buildx inspect multiplatform &>/dev/null; then
+
+                        if ! docker buildx inspect multiplatform >/dev/null 2>&1; then
                             echo "Creating new buildx builder..."
                             docker buildx create --name multiplatform --use
                         else
                             echo "Using existing buildx builder..."
                             docker buildx use multiplatform
                         fi
-                        
-                        # Bootstrap the builder
+
                         docker buildx inspect --bootstrap
-                        
+
                         echo "✅ Buildx setup complete"
                     '''
                 }
             }
         }
-        
+
         stage('Build Docker Image') {
             steps {
                 echo '🏗️  Building Docker image...'
                 script {
                     sh """
                         set -e
-                        
-                        echo "Building multi-platform image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
-                        
-                        # Build Docker image for multiple platforms (amd64 and arm64)
-                        # Using --load since we need to push separately
+
+                        echo "Building image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
                         docker buildx build \
                             --platform linux/amd64 \
                             -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} \
                             -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest \
                             --load \
                             .
-                        
+
                         echo "✅ Docker image built successfully"
-                        
-                        # Show image details
+
                         docker images ${ECR_REGISTRY}/${ECR_REPOSITORY}
                     """
                 }
             }
         }
-        
+
         stage('Push to ECR') {
             steps {
                 echo '📤 Pushing Docker image to ECR...'
                 script {
                     sh """
                         set -e
-                        
-                        # Push timestamped tag
+
                         echo "Pushing: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
                         docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
-                        
-                        # Push latest tag
+
                         echo "Pushing: ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
                         docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
-                        
+
                         echo "✅ Images pushed successfully"
                     """
                 }
             }
         }
-        
+
         stage('Verify ECR Image') {
             steps {
                 echo '🔍 Verifying image exists in ECR...'
                 script {
                     sh """
                         set -e
-                        
-                        echo "Checking if image exists in ECR..."
+
                         aws ecr describe-images \
                             --repository-name ${ECR_REPOSITORY} \
                             --image-ids imageTag=${IMAGE_TAG} \
                             --region ${AWS_REGION}
-                        
+
                         echo "✅ Image verified in ECR"
-                        
-                        # List recent images
+
                         echo ""
                         echo "Recent images in repository:"
                         aws ecr describe-images \
                             --repository-name ${ECR_REPOSITORY} \
                             --region ${AWS_REGION} \
-                            --max-items 5 \
                             --query 'sort_by(imageDetails,& imagePushedAt)[-5:].[imageTags[0],imagePushedAt]' \
                             --output table
                     """
                 }
             }
         }
-        
+
         stage('Setup kubectl') {
             steps {
                 echo '⚙️  Configuring kubectl for EKS...'
                 script {
                     sh '''
                         set -e
-                        
-                        # Update kubeconfig for EKS cluster
+
                         echo "Updating kubeconfig for cluster: ${EKS_CLUSTER_NAME}"
                         aws eks update-kubeconfig \
                             --name ${EKS_CLUSTER_NAME} \
                             --region ${AWS_REGION}
-                        
-                        # Verify connection
+
                         echo "Testing connection to EKS cluster..."
                         kubectl version --client
                         kubectl cluster-info
                         kubectl get nodes
-                        
+
                         echo "✅ kubectl configured and connected successfully"
                     '''
                 }
             }
         }
-        
+
         stage('Verify Node IAM Permissions') {
             steps {
-                echo '🔍 Verifying node IAM permissions for ECR...'
+                echo '🔍 Verifying node IAM permissions for ECR (informational)...'
                 script {
                     sh '''
-                        set -e
-                        
-                        echo "Checking node instance profile..."
-                        
-                        # Get node instance ID
-                        NODE_NAME=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
-                        echo "Node: ${NODE_NAME}"
-                        
-                        # Check if nodes can reach ECR
-                        echo ""
-                        echo "Checking node IAM role..."
-                        aws eks describe-nodegroup \
-                            --cluster-name ${EKS_CLUSTER_NAME} \
-                            --nodegroup-name ${EKS_CLUSTER_NAME}-nodegroup \
-                            --region ${AWS_REGION} \
-                            --query 'nodegroup.nodeRole' \
-                            --output text
-                        
+                        # Diagnostic only: never fails the build
                         NODE_ROLE=$(aws eks describe-nodegroup \
                             --cluster-name ${EKS_CLUSTER_NAME} \
                             --nodegroup-name ${EKS_CLUSTER_NAME}-nodegroup \
                             --region ${AWS_REGION} \
                             --query 'nodegroup.nodeRole' \
-                            --output text)
-                        
-                        echo ""
+                            --output text 2>/dev/null) || NODE_ROLE=""
+
+                        if [ -z "${NODE_ROLE}" ]; then
+                            echo "⚠️  Could not read node group role (name or permissions differ). Skipping."
+                            exit 0
+                        fi
+
                         echo "Node IAM Role: ${NODE_ROLE}"
-                        echo ""
-                        echo "Checking attached policies..."
-                        
-                        ROLE_NAME=$(echo ${NODE_ROLE} | awk -F'/' '{print $NF}')
-                        aws iam list-attached-role-policies --role-name ${ROLE_NAME}
-                        
-                        echo "✅ Node IAM permissions verified"
+                        ROLE_NAME=$(echo "${NODE_ROLE}" | awk -F'/' '{print $NF}')
+                        aws iam list-attached-role-policies --role-name ${ROLE_NAME} || \
+                            echo "⚠️  Could not list attached policies (missing iam:ListAttachedRolePolicies)"
+
+                        echo "✅ Node IAM check finished"
                     '''
                 }
             }
         }
-        
+
         stage('Cleanup Failed Deployments') {
             steps {
                 echo '🧹 Cleaning up any failed deployments...'
                 script {
                     sh '''
                         set -e
-                        
-                        # Check if deployment exists
+
                         if kubectl get deployment multi-doc-chat-live 2>/dev/null; then
                             echo "Found existing deployment, checking status..."
-                            
-                            # Get current status
+
                             kubectl get deployment multi-doc-chat-live
                             kubectl get pods -l app=multi-doc-chat-live
-                            
-                            # Check for ImagePullBackOff pods
+
                             FAILED_PODS=$(kubectl get pods -l app=multi-doc-chat-live --field-selector=status.phase!=Running -o name 2>/dev/null || echo "")
-                            
+
                             if [ -n "${FAILED_PODS}" ]; then
                                 echo ""
                                 echo "Found failed pods, describing one for diagnostics:"
                                 FIRST_POD=$(echo "${FAILED_PODS}" | head -1)
                                 kubectl describe ${FIRST_POD} || true
-                                
+
                                 echo ""
                                 echo "Deleting existing deployment to start fresh..."
                                 kubectl delete deployment multi-doc-chat-live
-                                
+
                                 echo "Waiting for pods to terminate..."
                                 kubectl wait --for=delete pod -l app=multi-doc-chat-live --timeout=60s || true
-                                
+
                                 echo "✅ Old deployment cleaned up"
                             else
                                 echo "Existing deployment is healthy, will perform rolling update"
@@ -397,132 +367,121 @@ pipeline {
                 }
             }
         }
-        
+
         stage('Create/Update Kubernetes Secrets') {
             steps {
                 echo '🔐 Creating/Updating Kubernetes secrets...'
                 script {
                     sh '''
                         set -e
-                        
-                        # Create secret with API keys
+
+                        # OpenRouter key plus base URLs, passed to the app as OpenAI-style variables
                         kubectl create secret generic multi-doc-chat-live-secrets \
-                            --from-literal=GROQ_API_KEY="${GROQ_API_KEY}" \
                             --from-literal=OPENAI_API_KEY="${OPENAI_API_KEY}" \
-                            --from-literal=GOOGLE_API_KEY="${GOOGLE_API_KEY}" \
+                            --from-literal=OPENAI_BASE_URL="${OPENAI_BASE_URL}" \
+                            --from-literal=OPENAI_API_BASE="${OPENAI_API_BASE}" \
                             --dry-run=client -o yaml | kubectl apply -f -
-                        
+
                         echo "✅ Application secrets created/updated successfully"
-                        
-                        # Verify secret exists
                         kubectl get secret multi-doc-chat-live-secrets
-                        
+
                         echo ""
                         echo "Creating ECR registry secret as backup authentication method..."
-                        
-                        # Get ECR token
+
                         ECR_TOKEN=$(aws ecr get-login-password --region ${AWS_REGION})
-                        
-                        # Create or update ECR pull secret
+
                         kubectl create secret docker-registry ecr-registry-secret \
                             --docker-server=${ECR_REGISTRY} \
                             --docker-username=AWS \
                             --docker-password="${ECR_TOKEN}" \
                             --dry-run=client -o yaml | kubectl apply -f -
-                        
+
                         echo "✅ ECR registry secret created/updated"
                         kubectl get secret ecr-registry-secret
                     '''
                 }
             }
         }
-        
+
         stage('Update Deployment Manifests') {
             steps {
                 echo '📝 Updating deployment manifests with ECR image...'
                 script {
                     sh """
                         set -e
-                        
-                        # Update deployment.yaml with actual ECR registry and repository
+
                         sed -i.bak "s|<ECR_REGISTRY>/<ECR_REPOSITORY>|${ECR_REGISTRY}/${ECR_REPOSITORY}|g" k8/deployment.yaml
-                        
+
                         echo "✅ Manifests updated"
                     """
                 }
             }
         }
-        
+
         stage('Apply Kubernetes Manifests') {
             steps {
                 echo '🚀 Applying Kubernetes manifests...'
                 script {
                     sh '''
                         set -e
-                        
-                        # Apply deployment
+
                         kubectl apply -f k8/deployment.yaml
-                        
-                        # Apply service
                         kubectl apply -f k8/service.yaml
-                        
+
                         echo "✅ Manifests applied successfully"
                     '''
                 }
             }
         }
-        
+
         stage('Update Deployment Image') {
             steps {
-                echo '🔄 Updating deployment with new image...'
+                echo '🔄 Updating deployment with new image and env...'
                 script {
                     sh """
                         set -e
-                        
-                        # Update deployment with new image tag
+
+                        # Make sure every key in the secret (including OPENAI_BASE_URL)
+                        # reaches the container, even if deployment.yaml only maps some keys
+                        kubectl set env deployment/multi-doc-chat-live \
+                            --from=secret/multi-doc-chat-live-secrets
+
                         kubectl set image deployment/multi-doc-chat-live \
-                            multi-doc-chat-live=${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} \
-                            --record
-                        
+                            multi-doc-chat-live=${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+
                         echo "✅ Deployment image updated to: ${IMAGE_TAG}"
                     """
                 }
             }
         }
-        
+
         stage('Verify Rollout') {
             steps {
                 echo '⏳ Waiting for rollout to complete...'
                 script {
                     sh '''
                         set -e
-                        
+
                         echo "Starting rollout verification..."
                         echo ""
-                        
-                        # Monitor rollout with timeout
+
                         TIMEOUT=300
                         ELAPSED=0
                         INTERVAL=10
-                        
+
                         while [ $ELAPSED -lt $TIMEOUT ]; do
-                            # Get deployment status
                             READY=$(kubectl get deployment multi-doc-chat-live -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
                             DESIRED=$(kubectl get deployment multi-doc-chat-live -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
-                            
+                            READY=${READY:-0}
+
                             echo "Status: ${READY}/${DESIRED} replicas ready"
-                            
-                            # Check for ImagePullBackOff
-                            FAILED_PODS=$(kubectl get pods -l app=multi-doc-chat-live -o jsonpath='{range .items[?(@.status.phase!="Running")]}{.metadata.name}{" "}{.status.containerStatuses[0].state.waiting.reason}{"\n"}{end}' 2>/dev/null || echo "")
-                            
+
+                            FAILED_PODS=$(kubectl get pods -l app=multi-doc-chat-live -o jsonpath='{range .items[?(@.status.phase!="Running")]}{.metadata.name}{" "}{.status.containerStatuses[0].state.waiting.reason}{"\\n"}{end}' 2>/dev/null || echo "")
+
                             if echo "${FAILED_PODS}" | grep -qE "ImagePullBackOff|ErrImagePull"; then
                                 echo ""
                                 echo "❌ ImagePullBackOff detected!"
-                                echo ""
-                                echo "Failed pods:"
                                 echo "${FAILED_PODS}"
-                                echo ""
-                                echo "Describing a failed pod for more details:"
                                 FAILED_POD=$(kubectl get pods -l app=multi-doc-chat-live -o jsonpath='{.items[?(@.status.phase!="Running")].metadata.name}' | awk '{print $1}')
                                 kubectl describe pod ${FAILED_POD}
                                 echo ""
@@ -530,23 +489,20 @@ pipeline {
                                 kubectl get events --field-selector involvedObject.name=${FAILED_POD} --sort-by='.lastTimestamp'
                                 exit 1
                             fi
-                            
-                            # Check if deployment is ready
+
                             if [ "${READY}" = "${DESIRED}" ] && [ "${READY}" != "0" ]; then
                                 echo ""
                                 echo "✅ Rollout completed successfully!"
                                 kubectl get pods -l app=multi-doc-chat-live -o wide
                                 exit 0
                             fi
-                            
+
                             sleep $INTERVAL
                             ELAPSED=$((ELAPSED + INTERVAL))
                         done
-                        
+
                         echo ""
                         echo "❌ Rollout timed out after ${TIMEOUT} seconds"
-                        echo ""
-                        echo "Current status:"
                         kubectl get deployment multi-doc-chat-live
                         kubectl get pods -l app=multi-doc-chat-live
                         exit 1
@@ -554,26 +510,25 @@ pipeline {
                 }
             }
         }
-        
+
         stage('Get Deployment Status') {
             steps {
                 echo '📊 Getting deployment status...'
                 script {
                     sh '''
                         set -e
-                        
-                        echo ""
+
                         echo "======================================"
                         echo "Deployment Status:"
                         echo "======================================"
                         kubectl get deployment multi-doc-chat-live
-                        
+
                         echo ""
                         echo "======================================"
                         echo "Pods:"
                         echo "======================================"
                         kubectl get pods -l app=multi-doc-chat-live -o wide
-                        
+
                         echo ""
                         echo "======================================"
                         echo "Service:"
@@ -583,64 +538,57 @@ pipeline {
                 }
             }
         }
-        
+
         stage('Get Service URL') {
             steps {
                 echo '🌐 Getting LoadBalancer URL...'
                 script {
                     sh '''
                         set -e
-                        
-                        echo ""
-                        echo "======================================"
+
                         echo "Waiting for LoadBalancer to be ready..."
-                        echo "======================================"
-                        
-                        # Wait up to 5 minutes for LoadBalancer to get external IP
-                        for i in {1..30}; do
+
+                        EXTERNAL_IP=""
+                        for i in $(seq 1 30); do
                             EXTERNAL_IP=$(kubectl get svc multi-doc-chat-service \
                                 -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-                            
+
                             if [ -n "${EXTERNAL_IP}" ] && [ "${EXTERNAL_IP}" != "null" ]; then
                                 echo ""
                                 echo "======================================"
                                 echo "✅ Application is accessible at:"
                                 echo "http://${EXTERNAL_IP}"
                                 echo "======================================"
-                                echo ""
                                 break
                             fi
-                            
+
                             echo "Waiting for LoadBalancer... (${i}/30)"
                             sleep 10
                         done
-                        
-                        if [ -z "${EXTERNAL_IP}" ] || [ "${EXTERNAL_IP}" == "null" ]; then
-                            echo "⚠️  LoadBalancer external IP not yet available"
+
+                        if [ -z "${EXTERNAL_IP}" ] || [ "${EXTERNAL_IP}" = "null" ]; then
+                            echo "⚠️  LoadBalancer external hostname not yet available"
                             echo "Run: kubectl get svc multi-doc-chat-service -w"
-                            echo "to watch for the external IP"
                         fi
                     '''
                 }
             }
         }
-        
+
         stage('Health Check') {
             steps {
                 echo '🏥 Performing health check...'
                 script {
                     sh '''
                         set -e
-                        
-                        # Get LoadBalancer URL
+
                         EXTERNAL_IP=$(kubectl get svc multi-doc-chat-service \
                             -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-                        
+
                         if [ -n "${EXTERNAL_IP}" ] && [ "${EXTERNAL_IP}" != "null" ]; then
                             echo "Testing health endpoint: http://${EXTERNAL_IP}/health"
-                            
-                            # Try health check (may take time for DNS to propagate)
-                            for i in {1..10}; do
+
+                            for i in $(seq 1 10); do
                                 if curl -f -s "http://${EXTERNAL_IP}/health" > /dev/null 2>&1; then
                                     echo "✅ Health check passed!"
                                     curl -s "http://${EXTERNAL_IP}/health"
@@ -649,25 +597,23 @@ pipeline {
                                 echo "Waiting for service to be ready... (${i}/10)"
                                 sleep 10
                             done
-                            
+
                             echo "⚠️  Health check did not pass within timeout"
                             echo "Application may still be starting up"
                         else
                             echo "⚠️  LoadBalancer not ready, skipping health check"
-                            echo "Check manually after LoadBalancer is provisioned"
                         fi
                     '''
                 }
             }
         }
     }
-    
+
     post {
         success {
             echo '✅ Deployment completed successfully! 🎉'
             script {
                 sh '''
-                    echo ""
                     echo "======================================"
                     echo "📋 Deployment Summary:"
                     echo "======================================"
@@ -675,46 +621,34 @@ pipeline {
                     echo "Cluster: ${EKS_CLUSTER_NAME}"
                     echo "Region: ${AWS_REGION}"
                     echo ""
-                    echo "To access the application:"
-                    echo "1. Get the LoadBalancer URL:"
-                    echo "   kubectl get svc multi-doc-chat-service"
-                    echo ""
-                    echo "2. View logs:"
-                    echo "   kubectl logs -l app=multi-doc-chat-live -f"
-                    echo ""
-                    echo "3. Check pods:"
-                    echo "   kubectl get pods -l app=multi-doc-chat-live"
-                    echo ""
+                    echo "Get the LoadBalancer URL: kubectl get svc multi-doc-chat-service"
+                    echo "View logs:               kubectl logs -l app=multi-doc-chat-live -f"
+                    echo "Check pods:              kubectl get pods -l app=multi-doc-chat-live"
                 '''
             }
         }
-        
+
         failure {
             echo '❌ Deployment failed!'
             echo '🔍 Check the console output above for error details.'
             script {
                 sh '''
-                    echo ""
                     echo "======================================"
-                    echo "Deployment Events (last 10):"
+                    echo "Deployment Events (last 20 lines):"
                     echo "======================================"
                     kubectl describe deployment multi-doc-chat-live | tail -20 || true
-                    
+
                     echo ""
-                    echo "======================================"
                     echo "Pod Status:"
-                    echo "======================================"
                     kubectl get pods -l app=multi-doc-chat-live || true
-                    
+
                     echo ""
-                    echo "======================================"
                     echo "Pod Logs:"
-                    echo "======================================"
                     kubectl logs -l app=multi-doc-chat-live --tail=50 || true
                 '''
             }
         }
-        
+
         always {
             echo '🧹 Cleaning up...'
             script {
@@ -723,7 +657,7 @@ pipeline {
                     if [ -f k8/deployment.yaml.bak ]; then
                         mv k8/deployment.yaml.bak k8/deployment.yaml
                     fi
-                    
+
                     # Clean up Docker images to save space
                     docker image prune -f || true
                 '''
