@@ -80,7 +80,7 @@ Resources:
         - Key: Name
           Value: !Sub '${ClusterName}-public-subnet-1'
         - Key: kubernetes.io/role/elb
-          Value: 1
+          Value: '1'
 
   PublicSubnet2:
     Type: AWS::EC2::Subnet
@@ -93,7 +93,7 @@ Resources:
         - Key: Name
           Value: !Sub '${ClusterName}-public-subnet-2'
         - Key: kubernetes.io/role/elb
-          Value: 1
+          Value: '1'
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
@@ -167,7 +167,6 @@ Resources:
               - sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
-        - arn:aws:iam::aws:policy/AmazonEKSServicePolicy
       Tags:
         - Key: Name
           Value: !Sub '${ClusterName}-cluster-role'
@@ -199,6 +198,7 @@ Resources:
     Type: AWS::ECR::Repository
     Properties:
       RepositoryName: !Ref ECRRepositoryName
+      EmptyOnDelete: true
       ImageScanningConfiguration:
         ScanOnPush: true
       ImageTagMutability: MUTABLE
@@ -217,8 +217,11 @@ Resources:
       - PublicSubnet2
     Properties:
       Name: !Ref ClusterName
-      Version: '1.28'
+      Version: '1.35'
       RoleArn: !GetAtt EKSClusterRole.Arn
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
       ResourcesVpcConfig:
         SecurityGroupIds:
           - !Ref ClusterSecurityGroup
@@ -250,7 +253,7 @@ Resources:
         MaxSize: !Ref MaxSize
       InstanceTypes:
         - !Ref NodeInstanceType
-      AmiType: AL2_x86_64
+      AmiType: AL2023_x86_64_STANDARD
       Tags:
         Name: !Sub '${ClusterName}-node'
 
