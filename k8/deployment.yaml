@@ -30,26 +30,23 @@ spec:
           name: http
           protocol: TCP
         env:
-        - name: GROQ_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: multi-doc-chat-live-secrets
-              key: GROQ_API_KEY
-              optional: true
         - name: OPENAI_API_KEY
           valueFrom:
             secretKeyRef:
               name: multi-doc-chat-live-secrets
               key: OPENAI_API_KEY
-              optional: true
-        - name: GOOGLE_API_KEY
+        - name: OPENAI_BASE_URL
           valueFrom:
             secretKeyRef:
               name: multi-doc-chat-live-secrets
-              key: GOOGLE_API_KEY
-              optional: true
+              key: OPENAI_BASE_URL
+        - name: OPENAI_API_BASE
+          valueFrom:
+            secretKeyRef:
+              name: multi-doc-chat-live-secrets
+              key: OPENAI_API_BASE
         - name: LLM_PROVIDER
-          value: "groq"
+          value: "openai"
         - name: PYTHONPATH
           value: "/app:/app/multi_doc_chat"
         - name: PORT
