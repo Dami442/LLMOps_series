@@ -10,6 +10,23 @@
  * Trigger: Manual only (run once to create infrastructure)
  * Duration: ~20-30 minutes
  */
+def analyzeFailure() {
+    try {
+        timeout(time: 3, unit: 'MINUTES') {
+            sh '''
+                if [ -f analyze_failure.py ]; then
+                    python3 analyze_failure.py > analysis.md 2>&1 || true
+                else
+                    echo "analyze_failure.py not found in the workspace (did checkout run?)" > analysis.md
+                fi
+            '''
+        }
+        archiveArtifacts artifacts: 'analysis.md', allowEmptyArchive: true
+        echo readFile('analysis.md')
+    } catch (err) {
+        echo "Analyzer skipped: ${err.message}"
+    }
+}
 
 pipeline {
     agent any
@@ -31,6 +48,9 @@ pipeline {
         MIN_SIZE = '1'
         MAX_SIZE = '3'
         ECR_REPOSITORY = 'multi-doc-chat-live'
+
+        OPENAI_API_KEY  = credentials('OPENROUTER_API_KEY')
+        OPENAI_BASE_URL = 'https://openrouter.ai/api/v1'
     }
     
     stages {
@@ -268,6 +288,9 @@ pipeline {
         failure {
             echo '❌ Infrastructure provisioning failed!'
             echo '🔍 Check the console output above for error details.'
+
+            script { analyzeFailure() } 
+            
             script {
                 sh '''
                     echo ""
